@@ -36,28 +36,32 @@ one-line policy change that is already implemented and measured below.
 
 ## 1. Scale
 
-Broadcast reaching the whole mesh, average degree 8, no loss.
+Broadcast reaching the whole mesh, average degree 8, no loss, under the **v0.4
+adaptive default**.
 
 | Nodes | Coverage | Frames | Amplification | p50 latency | p95 latency | Peak node memory |
 |---|---|---|---|---|---|---|
-| 100 | 100.0% | 679 | 6.8x/node | 114 ms | 163 ms | 1 KB |
-| 1,000 | 100.0% | 6,973 | 7.0x/node | 189 ms | 236 ms | 2 KB |
-| 10,000 | 100.0% | 69,961 | 7.0x/node | 267 ms | 315 ms | 2 KB |
+| 100 | 100.0% | 569 | 5.7x/node | 117 ms | 200 ms | 1 KB |
+| 1,000 | 100.0% | 5,745 | 5.7x/node | 220 ms | 280 ms | 2 KB |
+| 10,000 | 100.0% | 57,475 | 5.7x/node | 309 ms | 370 ms | 2 KB |
 
-Amplification is flat at ~7x — it equals average degree, not node count. Latency
-grows only logarithmically, because a small-world graph's diameter does. Peak
-per-node memory is 2 KB against a 25 MB ceiling: **four orders of magnitude of
-headroom** in normal operation.
+Amplification is flat at 5.7x across two orders of magnitude of population.
+Latency grows only logarithmically, because a small-world graph's diameter does.
+Peak per-node memory is 2 KB against a 25 MB ceiling: **four orders of magnitude
+of headroom** in normal operation.
 
-By topology, at 1,000 nodes:
+By topology, at 1,000 nodes — with the pre-v0.4 flooding figures alongside, since
+this is where the policy change earns its keep:
 
-| Topology | Avg degree | Coverage | Amplification | p95 latency |
-|---|---|---|---|---|
-| sparse | 4.0 | 100.0% | 3.0x | 462 ms |
-| normal | 8.0 | 100.0% | 7.0x | 236 ms |
-| dense | 23.7 | 100.0% | 22.7x | 134 ms |
+| Topology | Avg degree | Coverage | Amplification | p95 latency | (flooding amp) |
+|---|---|---|---|---|---|
+| sparse | 4.0 | 100.0% | 3.0x | 468 ms | 3.0x |
+| normal | 8.0 | 100.0% | 5.7x | 280 ms | 7.0x |
+| dense | 23.7 | 99.9% | **6.0x** | 280 ms | 22.7x |
 
-The tradeoff is visible in one line: density buys latency and costs traffic.
+Under flooding, cost tracked density: a crowd cost 22.7x. Under the adaptive
+default it is capped near 6x at any density, while sparse topologies are
+untouched because the policy floods there by design.
 
 ---
 
