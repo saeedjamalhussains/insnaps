@@ -62,3 +62,42 @@ class ReplayWindowTest {
         assertTrue(window.accept(42))
     }
 }
+
+/**
+ * Regression: a burst larger than the old 64-message window.
+ *
+ * File transfer emits chunks as a burst and the mesh reorders it arbitrarily. With
+ * a 64-bit window, exactly 64 of 112 chunks survived and the rest were rejected as
+ * replays -- a silent, data-losing failure found by the sandbox, not by unit tests.
+ */
+class ReplayWindowBurstTest {
+
+    @kotlin.test.Test
+    fun `a fully shuffled burst of a thousand messages is accepted`() {
+        val window = ReplayWindow()
+        val counters = (0L until 1000L).shuffled(kotlin.random.Random(99))
+        val accepted = counters.count { window.accept(it) }
+        kotlin.test.assertEquals(1000, accepted, "only $accepted of 1000 shuffled counters were accepted")
+    }
+
+    @kotlin.test.Test
+    fun `replays inside a shuffled burst are still caught`() {
+        val window = ReplayWindow()
+        val counters = (0L until 500L).shuffled(kotlin.random.Random(7))
+        counters.forEach { window.accept(it) }
+        kotlin.test.assertTrue(counters.none { window.accept(it) }, "a replay slipped through")
+    }
+
+    @kotlin.test.Test
+    fun `a counter older than the window is still rejected after wrapping`() {
+        // The ring index must not let a counter from a previous lap look unseen.
+        val window = ReplayWindow()
+        window.accept(0)
+        window.accept(ReplayWindow.WINDOW_SIZE * 3)
+        kotlin.test.assertFalse(window.accept(0), "a stale counter was accepted after the window wrapped")
+        kotlin.test.assertFalse(
+            window.accept(ReplayWindow.WINDOW_SIZE * 2),
+            "a counter outside the window was accepted",
+        )
+    }
+}

@@ -1,6 +1,7 @@
 package com.insnaps.core.routing
 
 import com.insnaps.core.crypto.RandomSource
+import kotlin.math.pow
 
 /**
  * How many neighbours a packet is forwarded to, and which.
@@ -119,12 +120,14 @@ sealed interface ForwardingPolicy {
             candidates: List<T>,
             conditions: LinkConditions,
             random: RandomSource,
+            weight: (T) -> Double = { 1.0 },
         ): List<T> {
             if (candidates.isEmpty()) return emptyList()
             return when (policy) {
                 is FullFlood -> candidates
                 is BoundedFanout -> candidates.take(policy.k)
-                is AdaptiveFanout -> candidates.take(policy.fanoutFor(conditions))
+                is AdaptiveFanout ->
+                    weightedSample(candidates, policy.fanoutFor(conditions), random, weight)
                 is Probabilistic -> {
                     val chosen = candidates.filter { coinFlip(random) < policy.p }
                     // Falling back to the best-ranked neighbours rather than random
@@ -135,12 +138,48 @@ sealed interface ForwardingPolicy {
             }
         }
 
-        private fun coinFlip(random: RandomSource): Double {
+        private fun coinFlip(random: RandomSource): Double = uniform(random)
+
+        private fun uniform(random: RandomSource): Double {
             val b = random.nextBytes(2)
             if (b.size < 2) return 0.0
             val value = ((b[0].toInt() and 0xFF) shl 8) or (b[1].toInt() and 0xFF)
             return value / 65535.0
         }
+
+        /**
+         * Samples [k] distinct candidates with probability proportional to weight.
+         *
+         * Efraimidis-Spirakis: give each candidate the key `u^(1/w)` for a uniform
+         * `u`, and take the [k] largest. One pass, no replacement, and the
+         * selection probability is exactly proportional to the weight -- which is
+         * what keeps a good relay preferred without letting it be picked every
+         * time.
+         */
+        private fun <T> weightedSample(
+            candidates: List<T>,
+            k: Int,
+            random: RandomSource,
+            weight: (T) -> Double,
+        ): List<T> {
+            if (k >= candidates.size) return candidates
+            if (k <= 0) return emptyList()
+
+            return candidates
+                .map { candidate ->
+                    // Floored so a peer scoring zero is unlikely rather than
+                    // impossible: in a thin neighbourhood it may be the only route.
+                    val w = weight(candidate).coerceAtLeast(MIN_WEIGHT)
+                    val u = uniform(random).coerceIn(MIN_UNIFORM, 1.0)
+                    candidate to u.pow(1.0 / w)
+                }
+                .sortedByDescending { it.second }
+                .take(k)
+                .map { it.first }
+        }
+
+        private const val MIN_WEIGHT = 0.05
+        private const val MIN_UNIFORM = 1e-9
     }
 }
 

@@ -30,7 +30,7 @@ class MemoryBudgetTest {
     @Test
     fun `the default configuration fits inside 25 MB`() {
         val config = MeshConfig()
-        val sessionBytes = SessionManager.DEFAULT_MAX_SESSIONS * 256L
+        val sessionBytes = SessionManager.DEFAULT_MAX_SESSIONS * 512L
 
         val total = config.worstCaseRelayBytes() + sessionBytes
         assertTrue(

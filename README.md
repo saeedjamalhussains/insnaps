@@ -45,6 +45,11 @@ The protocol core is implemented, tested and stress-tested. Radios are not.
 | Memory budget enforcement + RAM-only checks | done, tested |
 | Hostile-input and fuzz coverage | done — no peer-supplied input crashes a node |
 | Deterministic scale + adversarial simulation harness | done — 100 to 10,000 nodes |
+| Normal Mode: encrypted endpoint history | done, tested — core + storage contract |
+| Private Mode: ephemeral messages, expiry, key destruction | done, tested |
+| Capture / copy / notification protection policy | done, tested — **core policy only; Android and iOS implementations not written** |
+| Chunked encrypted file transfer (≤100 MB) | done, tested |
+| Sandbox: virtual phones, geography, mobility, simulated BLE | done — real core underneath, not a second implementation |
 | BLE / Wi-Fi transports (Android, iOS) | **not started** |
 | Platform `IdentityStore` (Keystore / Keychain) | **not started** — interface only |
 | UI | **not started** |
@@ -53,7 +58,7 @@ The protocol core is implemented, tested and stress-tested. Radios are not.
 ./gradlew :core:jvmTest
 ```
 
-144 tests, about 55 seconds.
+258 tests, about 2 minutes.
 
 - Protocol specification: [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - Scale, adversarial and routing results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
@@ -63,10 +68,66 @@ The protocol core is implemented, tested and stress-tested. Radios are not.
 ```
 v0.2  security / crash baseline
 v0.3  scalability, adversarial testing, routing-policy comparison
-v0.4  adaptive bounded-fanout policy      <- current
-v0.5  Android BLE
-v0.6  iOS BLE, then Android <-> iOS physical testing
+v0.4  adaptive bounded-fanout policy
+v0.5  Normal/Private modes, file transfer, capture policy
+v0.6  sandbox: virtual phones on a map, simulated BLE
+v0.7  geographic routing fix: weighted-random selection
+v0.8  chunk-aware file transfer protocol
+v0.8.1 reliable delivery: handshake retry, manifest ack, selective ack  <- current
+v0.9  Android BLE
+v1.0  iOS BLE, then Android <-> iOS physical testing
 ```
+
+## Communication modes
+
+Both modes use the same E2EE and the same mesh. The difference is entirely at the
+endpoints — **a relay cannot tell them apart** and behaves identically for both.
+The mode travels inside the ciphertext for exactly that reason.
+
+| | Normal | Private |
+|---|---|---|
+| End-to-end encryption | required | required |
+| Endpoint history | retained, encrypted at rest | RAM only |
+| Expiry | optional | required — view-once, 30s, 5m, 1h, 24h |
+| Relay storage / decryption | none / impossible | none / impossible |
+| Capture protection | OS default | strongest the platform offers |
+| Copy, clipboard, share | permitted | blocked |
+| Notification content | shown | redacted |
+| Files | ≤100 MB, chunked | ≤100 MB, chunked |
+
+Private plaintext lives in a store with no serialization path at all — it cannot
+write anything down, which is a stronger guarantee than a policy saying it should
+not. Buffers are zeroed on expiry; view-once is destroyed at the view, not on a
+later sweep.
+
+Normal Mode history is sealed before it reaches any storage API, under a key from
+the Keystore or Keychain that is deliberately distinct from the identity key. The
+persistence path *refuses* private messages rather than trusting callers to check.
+
+## File transfer
+
+Files travel as a manifest plus chunks, each sealed end-to-end and each carried in
+one packet. **Chunks use their own session channel**, so the message replay window
+never sees them: a window cannot distinguish legitimate reordering from replay at
+burst scale, while the receiver's per-chunk bitmap can do it exactly. The channel
+closes when the transfer ends, so a captured chunk cannot be replayed afterwards.
+
+Repair uses **paged ranges of missing chunks**, not per-chunk acknowledgement —
+one ACK per chunk would produce more return traffic than the file. Paging matters:
+truncating to a single ACK packet made a 23,406-chunk repair take 160+ rounds;
+paged, it takes 13.
+
+Measured across a four-phone geographic mesh: a 100 MB transfer is 234,058 chunks
+and peaked the relays at **1.22 MB**. Timings from the sandbox are simulator
+throughput, **not** BLE predictions — no connection intervals, MTU negotiation, OS
+scheduling or radio contention are modelled. **The 100 MB file limit and the 25 MB relay ceiling are independent**:
+a relay carrying a 200 KB file peaked at 28 KB, and the sender's peak buffer for a
+100 MB file is one chunk — 448 bytes.
+
+Chunks are 448 bytes because a packet carries at most 512, sized for BLE. The
+consequence is worth knowing before promising anything: **100 MB is about 234,000
+packets, which is hours over BLE, not minutes.** Large files are supported; they
+are not fast, and same-platform Wi-Fi accelerators are the only practical route.
 
 ## Architecture
 
@@ -179,16 +240,45 @@ queue before reaching the core.
   protection. A relay sees that a conversation is occurring, its size and timing;
   bootstrap addressing leaks a contact attempt to anyone holding the recipient's
   public key. See PROTOCOL.md §0.
-- **No range figure.** Not 10 km, not any number. Multi-hop reach depends on
-  device density, mobility and platform background limits. The open question is
-  how many real phones are needed to hold a route over a given distance, and only
-  device testing answers it.
+- **No coverage radius.** insnaps targets distances up to 10 km *where
+  participating-device density sustains a connected multi-hop path*. That is a
+  property of where people are standing, not of the protocol. A uniform 10 km
+  square would need roughly 140,000 devices at 100 m range — 10,000 over 100 km²
+  measured 1.9% connectivity. Real coverage follows **corridors** of density: a
+  road, a campus, a rail route, a venue. A claim expressed as a radius is not
+  meaningful and is not made.
 - **No performance claim on hardware.** Throughput, battery cost, discovery
   latency and real memory footprint are unmeasured. Frame counts are a battery
   proxy, not a measurement.
+- **No protection from a physical camera.** insnaps prevents application- and
+  OS-level capture where Android or iOS provides the control. It cannot stop a
+  separate camera photographing the screen, and never implies otherwise.
+- **iOS capture protection is weaker than Android's.** `FLAG_SECURE` blocks
+  capture; iOS can only *detect* recording and mirroring, and learns of a
+  screenshot after it has been taken. These are not equivalent and are not
+  described as such.
+- **Fast large-file transfer.** 100 MB is supported and is roughly 234,000
+  packets — hours over BLE, not minutes.
 - **Not production-ready cryptography.** See the release blocker below.
 
 ## Known gaps
+
+- **Reliable delivery has a measured envelope: ≤10% per-hop loss.** Beyond it,
+  handshake establishment is marginal rather than deterministic — two packets must
+  cross the whole path, so per-attempt success is the *square* of path survival
+  (~11% at 20% loss over five hops). The same loss can succeed at ten hops and
+  fail at five. Beyond 30% on a long path, no retry budget helps.
+- **Repair is whole-round, not per-chunk.** A sender resends everything the
+  receiver reports missing, so a lossy transfer costs ~2.9x at 30% loss/hop.
+- **The Android and iOS capture protections are not implemented.** What exists is
+  the decision logic in `commonMain` — when private content must be hidden, what
+  a notification may say, what copy is permitted — with tests. The platform code
+  that applies it (`FLAG_SECURE`, `UIScreen.isCaptured`, backgrounding hooks)
+  needs an Android SDK and Xcode, neither of which is on this machine. The
+  contract they must satisfy is `ScreenProtector` in `privacy/`.
+- **Platform `BlobStore` and `StorageKeyProvider` are interfaces only.** Normal
+  Mode history is encrypted in `commonMain`, so a platform implementation only
+  ever handles ciphertext — but it still has to be written.
 
 - **Release blocker: the Noise IK composition is hand-written.** Primitives come
   from the platform, but the pattern is not from a vetted library. It must be

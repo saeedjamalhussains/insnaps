@@ -269,7 +269,13 @@ class MeshEngine(
             // suppression -- each node forwards a given packet at most once -- not
             // by narrowing the fanout.
             val policy = if (entry.packet.header.broadcast) broadcastPolicy else unicastPolicy
-            val targets = ForwardingPolicy.select(policy, ranked, peers.linkConditions(ranked), random)
+            val targets = ForwardingPolicy.select(
+                policy = policy,
+                candidates = ranked,
+                conditions = peers.linkConditions(ranked),
+                random = random,
+                weight = { peers.availabilityScore(it) },
+            )
             if (targets.isEmpty()) continue
 
             val encoded = entry.packet.encode()

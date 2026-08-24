@@ -1,6 +1,6 @@
 # insnaps protocol specification
 
-Version 0.4 (core), draft. Normative statements use MUST / SHOULD / MAY.
+Version 0.8.1 (core), draft. Normative statements use MUST / SHOULD / MAY.
 
 **Platform scope: insnaps is exclusively an Android and iOS mobile application.**
 There is no desktop target and none is to be added. The JVM build exists only as
@@ -98,6 +98,22 @@ The selection is **adaptive bounded fanout**, and it is the specified default:
 
 always clamped to the number of neighbours available.
 
+**Which neighbours are chosen is normative, not an implementation detail.** The
+fanout MUST be sampled from the eligible neighbours *without replacement, with
+probability proportional to their availability score* — not taken as the
+highest-scoring `k`.
+
+Deterministic top-`k` selection was measured to deliver **55%** of a fully
+connected geographic mesh against flooding's 100%. The score is driven by peer
+quality — platform, foreground state — which carries no directional information,
+so every node selects the same favoured neighbours at every hop and the flood
+front stops expanding outward. This never appeared on random graphs, where any
+subset of neighbours spreads a packet everywhere; it appears immediately once
+neighbours are the devices physically within radio range.
+
+A high-quality relay MUST remain more *likely* to be selected. It MUST NOT be
+selected every time.
+
 *Rationale.* A fixed fanout and full flooding each fail in the other's best case.
 Capping the fanout in a thin neighbourhood makes some nodes structurally
 unreachable rather than merely less likely to be reached: with similarly-scored
@@ -108,9 +124,10 @@ turn, spends traffic and battery on redundancy nobody needs. Widening the fanout
 as conditions worsen — and collapsing to flooding when the neighbourhood is too
 thin to restrict safely — keeps flooding's resilience without its cost.
 
-*Measured (v0.4, docs/BENCHMARKS.md).* Against full flooding at 1,000 nodes:
-identical coverage in sparse, normal and dense topologies, with 74% fewer frames
-in a dense mesh and no difference at all in a sparse one.
+*Measured (v0.7, docs/BENCHMARKS.md).* On geographic topology, 1,000 devices in
+1 km²: **99.9% delivery at 6.0x amplification**, against flooding's 100% at 27.0x
+and gossip's 100% at 13.6x. Across 100 seeds: mean 99.8%, p5 99.6%, worst 99.4%.
+Unchanged on the original random-graph suite: 100% at 5.7x.
 
 Full flooding remains a valid policy and MAY be selected — as an emergency or
 diagnostic mode, or by a deployment that prefers it. A node's policy never
@@ -274,18 +291,47 @@ substitution is local and does not disturb the rest of the protocol.
 ### 7.3 Message framing
 
 ```
-  counter (8 bytes, cleartext) || AEAD ciphertext || tag
+  channel (4 bytes) || counter (8 bytes) || AEAD ciphertext || tag
 ```
 
-Nonce is `0x00000000 || counter`. Keys are directional, derived by the final
-HKDF split, so the two directions never share a nonce space. The counter is
-cleartext because the recipient needs it to derive the nonce before decrypting,
-and it is bound into the AEAD associated data, so editing it in flight produces
-an authentication failure.
+Nonce is `channel || counter`. Keys are directional, derived by the final HKDF
+split, so the two directions never share a nonce space, and each channel has its
+own counter space, so two channels can never collide on a nonce. Both header
+fields are cleartext because the recipient needs them to derive the nonce before
+decrypting, and both are bound into the AEAD associated data, so editing either
+produces an authentication failure.
+
+### 7.3.1 Channels
+
+Channel `0` is the **message channel** and carries conversation. Any other channel
+is opened for a specific purpose — currently a file transfer — and MUST be opened
+before its frames will decrypt, and closed when the purpose ends.
+
+A frame for a channel that is not open MUST be refused **before any key is used**.
+That is what prevents a chunk captured from a finished transfer being replayed
+into a still-live session.
+
+Open channels MUST be bounded (16 by default), so an attacker cannot grow the
+channel table by opening transfers.
 
 ### 7.4 Replay protection
 
-A 64-bit sliding window per session, over the message counter. A counter already
+**Channel 0** uses the sliding window (§7.5). **Other channels delegate replay
+protection to the layer above**, which is required to have an exact mechanism of
+its own.
+
+*Why the split exists.* A window is the right instrument for conversation, where
+messages are few and roughly ordered. It is the wrong instrument for a burst of
+234,000 file chunks that the mesh will reorder arbitrarily: with a 64-message
+window, exactly 64 of 112 chunks survived a transfer, rejected as replays,
+silently. Widening the window to 1024 masked the symptom; separating the channels
+removes the cause. A transfer already knows its own geometry — transfer id,
+manifest, chunk index, digest, expected size — and can therefore tell chunk
+#800 from a replay exactly, without inferring anything from arrival order.
+
+### 7.5 The message-channel window
+
+A 1024-bit sliding window per session, over the message counter. A counter already
 seen, or older than the window, MUST be rejected.
 
 This is separate from mesh-layer duplicate suppression (§3): that one is a
@@ -295,14 +341,14 @@ captured message cannot be replayed into a session later.
 The window MUST advance only for messages that have already authenticated.
 Advancing on receipt would let anyone burn counter slots with forgeries.
 
-### 7.5 Session expiry
+### 7.6 Session expiry
 
 A session MUST be destroyed when any bound is reached: maximum age (default 1
 hour), idle time (default 15 minutes), or messages sent (default 2^20). Expiry
 bounds the value of a compromised key and keeps unused key material from sitting
 in memory.
 
-### 7.6 Handshake addressing
+### 7.7 Handshake addressing
 
 Handshake packets in **both** directions use a *bootstrap* tag:
 `HMAC(recipientStaticPublicKey, "insnaps-init-v1" || epoch)`.
@@ -316,7 +362,7 @@ holding a peer's static public key can recognise when that peer is being
 contacted. This is strictly weaker than a pairwise tag and applies only to
 handshake packets; every subsequent message uses §4 addressing.
 
-### 7.7 Confidentiality boundary
+### 7.8 Confidentiality boundary
 
 Encryption happens strictly above the mesh layer and decryption strictly above
 it. The routing engine holds no key, has no reference to the session store, and
@@ -328,10 +374,203 @@ discovery and public announcements.
 
 ---
 
-## 8. Memory
+## 8. Application layer
 
-Only one value is intentionally persisted: the long-term identity private key,
-in the Android Keystore or iOS Keychain. Messages, routing state, relay buffers,
+Everything above the session layer travels inside the sealed payload. A relay
+sees ciphertext of an opaque length and nothing else — not the message type, not
+the conversation mode, not the expiry, not a file name.
+
+### 8.1 Message format
+
+```
+  version    1     MUST be 1
+  mode       1     0 = normal, 1 = private
+  type       1     1 text, 2 file manifest, 3 file chunk, 4 receipt
+  expiry     1     0 none, 1 view-once, 2 = 30s, 3 = 5m, 4 = 1h, 5 = 24h
+  messageId  8
+  body       n     up to 475 bytes
+```
+
+A private message MUST carry a non-zero expiry; a receiver MUST reject one that
+does not. Unknown type or expiry codes MUST be rejected rather than guessed —
+guessing an expiry wrong destroys a message early or keeps it too long.
+
+**The mode is inside the ciphertext deliberately.** Putting it in the packet
+header would have been simpler and would have leaked precisely the metadata
+private mode exists to protect: which conversations are sensitive.
+
+### 8.2 Conversation modes
+
+Both modes use the same E2EE and the same mesh. The difference is entirely at the
+**endpoints**; a relay cannot distinguish them and behaves identically for both.
+
+| | Normal | Private |
+|---|---|---|
+| End-to-end encryption | required | required |
+| Endpoint history | retained, encrypted at rest | RAM only |
+| Expiry | optional | required |
+| Relay storage | none | none |
+| Relay decryption | impossible | impossible |
+| Capture protection | OS default | strongest available |
+| Copy / clipboard / share | permitted | blocked |
+| Notification content | shown | redacted |
+
+### 8.3 Private mode lifecycle
+
+Private plaintext exists only in RAM, in a store with no serialization path of
+any kind. It is destroyed and its buffer zeroed when: the expiry deadline passes,
+a view-once message is viewed, the user deletes it, or the app shuts down.
+
+View-once is destroyed **at the view**, not on a later sweep, so the plaintext is
+gone the moment the view ends. An unviewed view-once message still expires under
+a 24-hour ceiling, so it cannot live indefinitely.
+
+As with session keys, zeroing narrows the exposure window and is not an erasure
+guarantee (§10).
+
+---
+
+## 9. File transfer
+
+Files travel as ordinary messages: a manifest, then chunks, each sealed
+end-to-end and each carried in one packet.
+
+### 9.1 Limits
+
+| | |
+|---|---|
+| Maximum file | 100 MB (configurable; does not appear on the wire) |
+| Chunk payload | 448 bytes |
+| Concurrent inbound transfers | 8 (bounds attacker-opened transfers) |
+
+**Chunk size is set by the packet, not by convenience.** A packet carries at most
+512 payload bytes, and after the AEAD tag, the application header and the chunk
+index there are 459 left. A 16–64 KB chunk — the usual figure for file transfer —
+cannot fit and would require a fragmentation layer that duplicates what the mesh
+already does.
+
+**The practical consequence must be stated rather than buried.** 100 MB is about
+234,000 packets. At realistic BLE mesh throughput — single-digit KB/s over a
+multi-hop path — that is hours, not minutes. Large files are *supported*; they
+are not *fast*, and nothing in this project should imply otherwise. Same-platform
+Wi-Fi accelerators are the only path to practical large transfers, and they work
+only between peers on the same platform.
+
+### 9.2 Manifest
+
+```
+  transferId   8
+  totalBytes   8
+  chunkSize    4
+  chunkCount   4
+  digest      32
+  channel      4     session channel the chunks will arrive on; MUST NOT be 0
+  nameLength   1
+  fileName     n     treated as sensitive content, not metadata
+```
+
+A manifest claiming channel 0 MUST be rejected: chunks must never be routed
+through the message channel, where the replay window would reject legitimate
+reordering.
+
+A receiver MUST reject a manifest whose declared geometry is inconsistent —
+`chunkCount != ceil(totalBytes / chunkSize)` — because otherwise a sender could
+claim a small file and stream an unbounded number of chunks into an accepted
+transfer. It MUST also reject a manifest over the configured maximum **before**
+buffering any chunk, so claiming a large transfer costs the receiver nothing.
+
+### 9.3 Integrity
+
+`digest` is a chained hash: `h = SHA256(h || chunk)` from a domain-separated
+constant. Chained rather than a plain hash of the file so it can be computed and
+verified incrementally — neither endpoint ever holds the whole file, which is the
+entire point of chunking.
+
+On mismatch the receiver MUST discard the partial output rather than present it
+as a file. Per-chunk authenticity is already provided by the session AEAD; the
+digest additionally catches reordering and substitution across the whole file.
+
+### 9.4 Transfer-level replay protection
+
+The receiver holds one bit per chunk index. A chunk whose bit is set is a
+duplicate and is ignored; a chunk whose bit is clear is new, however far out of
+order it arrived. This is exact rather than approximate, which is precisely what
+a sliding window cannot be at burst scale.
+
+Replay across transfers is prevented by the channel: a chunk from another
+transfer carries a different channel in its nonce and associated data, so it
+fails authentication. Replay after a transfer ends is prevented by closing the
+channel.
+
+### 9.5 Resuming
+
+A receiver MUST be able to report the chunk indices it still lacks, so a sender
+can resend exactly those. Restarting a 100 MB transfer because one packet was
+dropped is not acceptable behaviour on a lossy mesh.
+
+*Measured cost.* At 30% loss per hop over three hops — roughly a 34% end-to-end
+success rate — a 447-chunk transfer completed after **17 resend rounds** and
+**2.9x** the chunk sends. The tail decays geometrically because there is no
+per-chunk acknowledgement, only whole-round retries.
+
+### 9.6 Behaviour under mesh conditions
+
+- **Duplicate chunks** are expected — the mesh delivers by several paths — and
+  MUST be ignored, not treated as an attack.
+- **Out-of-order chunks** MUST be accepted; they are buffered until the gap fills,
+  because the digest is chained and must be fed in order.
+- **A chunk of the wrong size, or an out-of-range index,** MUST be rejected.
+- **An interrupted or cancelled transfer** MUST discard its partial output.
+
+### 9.7 Relay behaviour is unchanged
+
+A relay sees chunk packets as ordinary packets. It cannot tell file traffic from
+text, holds no transfer state, and is bounded by §6 exactly as before. **A relay
+never needs 100 MB of RAM to carry a 100 MB file** — measured peak on a relay
+carrying a 200 KB file is 28 KB, and the sender's peak buffer for a 100 MB file
+is one chunk: 448 bytes. Measured across a four-phone geographic mesh: a full
+100 MB transfer (234,058 chunks) peaked the relays at **1.22 MB**.
+
+---
+
+## 10. Memory and storage
+
+### 10.1 The 25 MB ceiling applies to relays only
+
+The ceiling bounds the **relay/forwarding subsystem**: encrypted packet buffers,
+routing state, peer state, duplicate suppression, and temporary forwarding state.
+
+It is **not** a limit on the application, the device, the sender, the recipient,
+or a user's own conversation history. A user with 2 GB of Normal Mode history is
+not in violation of it; that history is endpoint storage, which the ceiling does
+not govern. Conflating the two would either cripple normal usage or quietly
+weaken the relay guarantee.
+
+### 10.2 Endpoint storage
+
+| Role | Normal mode | Private mode |
+|---|---|---|
+| Sender | encrypted history, retained | RAM only |
+| Recipient | encrypted history, retained | RAM only |
+| Relay | nothing | nothing |
+
+Normal Mode history is sealed with AES-256-GCM under a storage key held in
+platform-protected storage (Android Keystore, iOS Keychain, Secure Enclave-backed
+where available) before it reaches any storage API, so what lands on disk is
+ciphertext. The peer identity and message id are bound in as associated data, so
+a record cannot be moved between conversations or relabelled.
+
+The storage key MUST be distinct from the identity key. Sharing one key means a
+compromise of local storage also compromises the identity, and makes rotating
+either impossible without breaking the other.
+
+The persistence path MUST refuse private-mode messages outright, rather than
+relying on callers to check the mode first.
+
+### 10.3 Identity
+
+Only one value is intentionally persisted for the protocol itself: the long-term
+identity private key, in the Android Keystore or iOS Keychain. Messages, routing state, relay buffers,
 session keys, peer records and conversation state are RAM-only.
 
 Key material is wrapped so ownership is explicit and is zeroed when a session
@@ -352,7 +591,48 @@ on first launch after install.
 
 ---
 
-## 9. Concurrency
+## 11. Capture protection
+
+Applies to Private Mode. Every claim here is bounded by what the platform
+actually provides.
+
+**Android.** `FLAG_SECURE` on the window blocks screenshots, excludes the window
+from screen recording, and keeps it out of the recents snapshot. It is a genuine
+block, and the app is not notified that a capture was attempted.
+
+**iOS.** There is no equivalent block. `UIScreen.isCaptured` reports that
+recording or mirroring is active, and `userDidTakeScreenshotNotification` fires
+*after* a screenshot has been taken. So iOS can hide content while a recording
+runs, and can react to a screenshot, but cannot prevent one.
+**Implementations MUST NOT present iOS behaviour as equivalent to `FLAG_SECURE`.**
+
+**Both platforms.** Private content MUST be hidden before the app leaves the
+foreground, so it is absent from the recents snapshot and the app-switcher
+preview — both are taken as the app backgrounds, so hiding afterwards is too
+late. Content returns only when *every* reason to hide has cleared.
+
+**Copy, clipboard, drag and share MUST be disabled** for private content wherever
+the platform allows.
+
+**Notifications MUST NOT carry private content** — not on the lock screen, in
+notification history, or on a paired wearable. The redacted text carries no
+sender name either, since knowing who is messaging is itself the metadata private
+mode protects.
+
+**Private plaintext, keys and identifiers MUST NOT be written** to logs,
+analytics, telemetry, debug output, crash reports or any file.
+
+### 11.1 The physical camera limitation
+
+> insnaps prevents application- and OS-level capture where Android or iOS
+> provides the required controls. **insnaps cannot prevent a separate physical
+> camera or recording device from photographing or recording the display.**
+
+This MUST be stated plainly in the product and never implied away.
+
+---
+
+## 12. Concurrency
 
 The protocol core is single-threaded by contract. Transport implementations MUST
 deliver every callback on one thread, and callers MUST drive the node from that
@@ -365,7 +645,125 @@ reaching the core.
 
 ---
 
-## 10. What is NOT yet established
+## 13. Coverage and the distance target
+
+insnaps targets communication across geographic distances of **up to 10 km where
+sufficient participating-device density exists to maintain a connected multi-hop
+path**. Coverage depends on topology, radio range, device density, mobility and
+platform availability.
+
+It is not a radius, and it is not a property of the protocol. It is a property of
+where the participants happen to be standing.
+
+### 13.1 Why uniform area coverage is the wrong model
+
+At a 100 m simulated range, a uniform scatter needs an average degree of roughly
+4.5 before a random geometric graph stops fragmenting into islands. For a 10 km
+square that works out to about **140,000 devices**. Measured: 10,000 devices over
+100 km² produce a largest connected component of **1.9%** — thousands of tiny
+islands, not a mesh.
+
+### 13.2 Corridors are the realistic topology
+
+People are not uniformly scattered. They are strung along roads, campuses, rail
+routes, high streets, and packed into venues. A corridor of participants forms a
+connected chain across a distance that the same population spread evenly over the
+same area could never cover:
+
+```
+  ●──●──●──●──●──●──●──●        a road, a rail route, a high street
+                 │
+                 ●
+                 │
+                 ●              a branch into a venue or campus
+                 │
+                 ●
+```
+
+Reaching 10 km therefore means a **chain of density**, not a covered area. Any
+coverage claim MUST state the density and topology it assumes; a claim expressed
+purely as a radius is not meaningful and MUST NOT be made.
+
+---
+
+## 14. Reliability
+
+Each stage of `handshake -> manifest -> chunks -> completion` fails differently on
+a lossy path, and before v0.8.1 each failed *silently*. Every stage now ends in a
+definite outcome.
+
+### 14.1 Handshake
+
+Handshakes MUST be retransmitted under a bounded policy: backoff, an attempt
+limit, an overall deadline, and duplicate suppression so a second request for a
+peer already being contacted is ignored. The exchange ends established, or failed
+with a reason that MUST be reported upward — "could not reach this contact" is
+useful; silence is not.
+
+**A retransmission MUST resend the original message verbatim.** Generating a
+fresh handshake per attempt looks harmless and is not: each carries a new
+ephemeral key, so a reply already in flight for an earlier attempt can no longer
+be decrypted, and every attempt must then complete within a single round trip.
+
+**Sizing.** A handshake needs *two* packets to cross the whole path, so the
+per-attempt success rate is the square of path survival. At 20% per-hop loss over
+five hops that is ~11%. Eight attempts failed outright; sixteen succeeded at ten
+hops and failed at five on the same loss. The default is 32.
+
+### 14.2 Manifest
+
+The manifest is a reliable control message and MUST be retransmitted until
+acknowledged. It is the only message that explains what the chunks are, so losing
+it means the chunks arrive and cannot be interpreted — measured at **1 of 10**
+single attempts arriving at 30% loss.
+
+### 14.3 Selective acknowledgement
+
+Chunk repair uses **ranges of missing indices**, not per-chunk acknowledgement.
+One ACK per chunk would turn a 234,058-chunk file into more return packets than
+the traffic it acknowledges.
+
+Acknowledgements MUST be **paged across several packets** rather than truncated to
+one. Losses are scattered rather than contiguous, so the missing set collapses
+into thousands of single-chunk ranges — far more than the 58 that fit one packet.
+Reporting only the first 58 makes repair take `missing / 58` rounds: a
+23,406-chunk transfer needed **160+ rounds** truncated, and **13** once paged.
+
+Feedback MUST stay bounded (64 packets per round by default) so the repair channel
+cannot itself become the traffic problem.
+
+**The relay is not involved in any of this.** Acknowledgement is receiver-side
+bookkeeping; a relay never learns a transfer exists, let alone which chunks are
+missing. It forwards encrypted packets and holds nothing.
+
+### 14.4 Measured envelope
+
+100 KB file, per-hop loss, geographic line topology:
+
+| Hops | 0% | 5% | 10% | 20% | 30% | 50% |
+|---|---|---|---|---|---|---|
+| 3 | ok 1.0x | ok 1.2x | ok 1.4x | ok 2.0x | ok 2.8x | fail |
+| 5 | ok 1.0x | ok 1.3x | ok 1.7x | marginal | fail | fail |
+| 10 | ok 1.0x | ok 1.7x | ok 3.1x | ok 9.4x | fail | fail |
+
+`ok Nx` is completion at N times the minimum chunk sends. Peak relay memory never
+exceeded 0.11 MB of the 25 MB ceiling anywhere in this table.
+
+**The reliable envelope is <=10% per-hop loss at every distance tested.** Beyond
+it, establishment is genuinely marginal rather than deterministic, which is why
+the same loss can succeed at ten hops and fail at five. Beyond 30% on a long path
+no retry budget rescues it: the path is not usable, and the exchange fails with a
+reason instead of retrying forever.
+
+10 MB over five hops at 10% loss: 23,406 chunks, 13 rounds, 1.70x overhead, peak
+relay memory 1.22 MB.
+
+Heterogeneous fleets — all-Android, 70/30 mixed with half backgrounded, and
+all-iOS backgrounded — all completed at five hops and 10% loss.
+
+---
+
+## 15. What is NOT yet established
 
 The JVM simulation validates protocol behaviour — delivery, suppression, hop
 limits, expiry, quota enforcement — under a synthetic transport. It says nothing
@@ -387,7 +785,7 @@ under a synthetic transport:
 
 | Question | Acceptance test to be written |
 |---|---|
-| **Devices needed per unit distance** | **how many real phones are required to hold a usable route over a given geographic distance — the question any coverage claim actually rests on** |
+| **Devices needed per unit distance** | partially answered in simulation (§14); still needs real radios |
 | Multi-hop range | measured coverage vs. node density on real hardware |
 | Real throughput and battery | frames/second and battery draw on a device, not a frame-count proxy |
 | Discovery latency | time to first delivery after two groups come into range |

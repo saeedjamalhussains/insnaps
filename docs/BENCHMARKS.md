@@ -1,4 +1,4 @@
-# insnaps Core v0.3/v0.4 — scalability, adversarial results, routing policy
+# insnaps Core v0.3–v0.5 — scalability, adversarial results, routing, file transfer
 
 Every figure here is produced by the seeded simulation suite in
 `core/src/jvmTest/.../sim/` and reproduces exactly from its seed. Reproduce with:
@@ -197,7 +197,173 @@ interoperate.
 
 ---
 
-## 5. Still unestablished
+## 5. File transfer and the two memory limits
+
+The 100 MB file limit and the 25 MB relay ceiling are independent, and chunking is
+why. Measured:
+
+| | |
+|---|---|
+| 200 KB file across a relay (447 chunks) | relay peaked at **28 KB** |
+| 100 MB file, sender's peak buffer | **448 bytes** — one chunk |
+| 100 MB file, chunk count | 234,058 packets |
+| Relay sessions held while carrying the file | 0 |
+| Relay decryptions while carrying the file | 0 |
+| File plaintext appearing in any frame on the air | none |
+| 20,000 hostile chunk-shaped packets at a relay | bounded under the ceiling |
+
+A relay never needs 100 MB of RAM to carry a 100 MB file; it never holds more
+than packets, and it cannot tell file traffic from text.
+
+**The number that matters for expectations.** 234,058 packets at realistic BLE
+mesh throughput — single-digit KB/s across a multi-hop path — is **hours**, not
+minutes. Large files are supported by the protocol and are not practical over BLE
+alone. Same-platform Wi-Fi accelerators are the only route to practical large
+transfers, and only between peers on the same platform. This is a measured
+consequence of the 512-byte packet, not a pessimistic guess.
+
+---
+
+## 6. Sandbox: geographic topology (v0.6)
+
+The sandbox places virtual phones on a map with a modelled BLE radio and runs the
+**real** protocol core on each — the shipped `MeshEngine`, `SecureMesh` and
+session layer, with only the transport and the physical world simulated. Two
+devices link only when `distance <= range`.
+
+Range, loss, latency and bandwidth are **simulation parameters, not handset
+measurements**. 100 m is a plausible open-air BLE figure; walls and bodies will be
+worse.
+
+### 6.1 Bounded fanout failed on geographic topology — found, diagnosed, fixed
+
+Every earlier routing result came from *random* graphs, where a node's neighbours
+are scattered across the whole network. Physical radio is not like that: every
+neighbour is within 100 m, so a subset of neighbours points at the same patch of
+ground.
+
+1,000 devices, 1 km², average degree 29, fully connected:
+
+| Policy | Delivery | Avg hops | Amplification |
+|---|---|---|---|
+| full flood | 100.0% | 6.2 | 27.0x |
+| **adaptive, v0.7 weighted-random (default)** | **99.9%** | 8.3 | **6.0x** |
+| adaptive, v0.4 deterministic top-k | 55.2% | 8.3 | 3.3x |
+| bounded fanout 6 (still deterministic) | 55.2% | 8.3 | 3.3x |
+| bounded fanout 12 | 80.0% | 7.4 | 9.6x |
+| gossip p=0.5 | 100.0% | 6.7 | 13.6x |
+
+**The v0.4 conclusion inverts under geography.** Adaptive fanout — chosen because
+it matched flooding on random graphs for a quarter of the traffic — loses 45% of
+the network. Probabilistic gossip, which was the *worst* option on random graphs,
+achieves full coverage at half of flooding's cost.
+
+**Mechanism, confirmed by experiment.** The fanout picks the top-scoring
+neighbours, and the score is driven by peer quality — platform and foreground
+state — which carries no directional information. The same high-scoring
+neighbours are chosen at every hop, so the flood front stops expanding. Making
+every device identical in quality, so the tie-break jitter randomises the choice,
+restores it:
+
+| Fleet | Delivery, fanout 6 |
+|---|---|
+| mixed Android/iOS, mixed foreground | 55.2% |
+| all Android, all foreground | **99.7%** |
+
+Heterogeneous fleets are the real case, so this is not a corner condition.
+
+**Fixed in v0.7.** The fanout is now sampled without replacement with probability
+proportional to score (Efraimidis–Spirakis), rather than taken as the top `k`. A
+good relay stays more likely to be chosen; it is no longer chosen every time.
+Delivery went from 55.2% to **99.9%**, at 6.0x amplification — 22% of flooding's
+traffic and 44% of gossip's.
+
+`BoundedFanout` still selects deterministically and still shows 55.2%, which is
+what keeps the comparison meaningful rather than erasing the evidence.
+
+**Validation of the fix**
+
+| Condition | Result |
+|---|---|
+| 100 seeds, 1,000 devices, 1 km² | mean 99.8%, p5 99.6%, worst 99.4% |
+| all Android foreground | 99.9% |
+| 70/30 mix, half backgrounded | 99.9% |
+| all iOS, all backgrounded | 100.0% |
+| 50/50 mix, mostly backgrounded | 99.8% |
+| density 100 → 3,000 devices | 99.9% → 96.4% |
+| loss 0% → 30% | 99.9% → 98.9% |
+| loss 50% | 94.8% |
+| 20% of the mesh leaves mid-run | 99.7% of survivors reached; all 200 returning devices got the next broadcast |
+| peak relay RAM, 3,000 devices | 0.006 MB of 25 MB |
+| original random-graph suite | unchanged: 100% at 5.7x |
+
+### 6.2 How many phones does 10 km actually need?
+
+10 km × 10 km, 100 m range. Expected degree is `n·πr²/A`; below roughly 4.5 a
+random geometric graph fragments into islands.
+
+| Devices | Density /km² | Avg degree | Largest component |
+|---|---|---|---|
+| 10 | 0.1 | 0.0 | 10% |
+| 100 | 1.0 | 0.0 | 2% |
+| 1,000 | 10 | 0.4 | 0.4% |
+| 5,000 | 50 | 1.6 | 0.5% |
+| 10,000 | 100 | 3.1 | 1.9% |
+
+**10,000 devices spread over 100 km² do not form a connected mesh** — they form
+thousands of tiny islands. Covering a 10 km square at 100 m range needs roughly
+`4.5·A/(πr²)` ≈ **140,000 devices** uniformly scattered, which is a population
+density no realistic deployment provides uniformly.
+
+This does not kill the 10 km target; it reframes it, and the specification has
+been changed to match (PROTOCOL.md §13). Coverage is achievable along *corridors*
+of density — a road, a campus, a rail route, a high street, a venue — not across
+an evenly populated square. A coverage claim expressed purely as a radius is not
+meaningful and is not made.
+
+### 6.3 Resilience and attack, geographic
+
+| | |
+|---|---|
+| Delivery, 1,000 devices in 1 km², 10% loss, 50 seeds | mean 100%, p5 100%, min 100% |
+| Loss sweep 0–50% (20 seeds each) | 100% down to 99.9% at 50% loss |
+| Connectivity, 1,000 devices in 2 km², 30 seeds | mean 99.4%, min 96.3% |
+| Relay failure mid-conversation | rerouted, delivery preserved |
+| 30,000 hostile frames from a malicious device | peak relay RAM 2.2 MB of 25 MB; no crash; mesh functional after |
+| 50 KB file across 2 relays with real E2EE | completed; relays held no session and decrypted nothing |
+
+### 6.4 Reliability (v0.8.1)
+
+Sandbox throughput figures are **not** BLE performance predictions. The simulator
+does not model connection intervals, MTU negotiation, OS scheduling, radio
+contention or interference. A "100 MB in 5 seconds" result describes the
+simulator, not a phone.
+
+| Stage | Before v0.8.1 | After |
+|---|---|---|
+| handshake at 30% loss / 3 hops | 9 uncoordinated attempts, no failure signal | bounded retry, backoff, reported outcome |
+| manifest at 30% loss | 1 of 10 arrived, transfer never started | retransmitted until acknowledged |
+| chunk repair, 23,406-chunk file | 160+ rounds (one truncated ACK per round) | **13 rounds**, 1.70x overhead (paged ACKs) |
+| 200 KB at 30% loss/hop | 17 rounds, 2.9x overhead | unchanged; whole-round retry is the cost |
+
+Reliable envelope: **<=10% per-hop loss at 3, 5 and 10 hops.** Peak relay memory
+across the entire matrix: **0.11 MB of 25 MB**.
+
+### 6.5 A defect the sandbox found
+
+**The replay window was too small for file transfer.** File chunks are emitted as
+a burst and per-hop jitter reorders that burst arbitrarily. With the original
+64-message window, exactly **64 of 112 chunks** arrived — the rest were rejected
+as replays, silently, with no error anywhere. Any file over 64 chunks (about 28
+KB) would have failed in the field.
+
+Fixed by widening the window to 1024 messages, a ring-indexed bitmap costing 128
+bytes per session. Unit tests had not caught it because they tested reordering,
+not reordering *at burst scale*.
+
+---
+
+## 7. Still unestablished
 
 Unchanged by this milestone, and not to be claimed:
 

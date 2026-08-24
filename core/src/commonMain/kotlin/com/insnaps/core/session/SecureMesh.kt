@@ -36,7 +36,29 @@ class SecureMesh(
     private val sessions: SessionManager,
     private val clock: Clock,
     private val listener: Listener,
+    /** Retransmission schedule for handshakes. See [HandshakeSupervisor]. */
+    retryPolicy: RetryPolicy = RetryPolicy(),
 ) : MeshEngine.MeshListener {
+
+    /**
+     * Drives handshakes to a definite outcome instead of leaving the caller to
+     * infer one from repeated `NoSession` results.
+     */
+    private val handshakes = HandshakeSupervisor(clock, retryPolicy)
+
+    /**
+     * The first handshake message per peer, retained so retries resend it verbatim.
+     *
+     * Generating a fresh handshake on each retry looks harmless and is not: each
+     * attempt carries a new ephemeral key, so a reply already in flight for an
+     * earlier attempt can no longer be decrypted, and every attempt must therefore
+     * complete inside a single round trip. On a lossy multi-hop path that made
+     * retrying almost useless -- measured as outright failure at five hops with
+     * 20% per-hop loss even after fourteen attempts. Resending the same bytes
+     * makes every attempt an independent chance, and any reply to any of them
+     * completes the exchange.
+     */
+    private val handshakeMessages = HashMap<PeerIdentity, ByteArray>()
 
     interface Listener {
         /** A decrypted message from an authenticated peer. */
@@ -44,6 +66,14 @@ class SecureMesh(
 
         /** A session was established, by either side. */
         fun onSessionEstablished(peer: PeerIdentity)
+
+        /**
+         * A handshake gave up.
+         *
+         * Reported so the caller can say "could not reach this contact" instead of
+         * silently returning `NoSession` forever.
+         */
+        fun onHandshakeFailed(peer: PeerIdentity, reason: FailureReason, attempts: Int) {}
 
         /**
          * A broadcast arrived. Broadcasts are not encrypted to any recipient and
@@ -75,6 +105,8 @@ class SecureMesh(
         var handshakesInitiated: Long = 0,
         var handshakesCompleted: Long = 0,
         var handshakesRejected: Long = 0,
+        var handshakeRetries: Long = 0,
+        var handshakesFailed: Long = 0,
         var messagesDecrypted: Long = 0,
         var undecryptable: Long = 0,
         var malformedEnvelopes: Long = 0,
@@ -84,12 +116,45 @@ class SecureMesh(
 
     // ---- outbound ----------------------------------------------------------
 
-    /** Begins a handshake with [peer], whose static public key must already be known. */
-    fun connect(peer: PeerIdentity): PacketId {
-        val message = sessions.beginHandshake(peer)
-        stats.handshakesInitiated++
+    /**
+     * Begins a handshake with [peer], whose static public key must already be known.
+     *
+     * Returns null if one is already in flight — duplicate suppression, so a user
+     * tapping twice does not open two exchanges. Retransmission is handled by
+     * [tick]; the caller does not have to poll for it.
+     */
+    fun connect(peer: PeerIdentity): PacketId? {
+        if (sessions.sessionFor(peer) != null) return null
+        if (!handshakes.begin(peer)) return null
+        return sendHandshakeMessage(peer)
+    }
+
+    private fun sendHandshakeMessage(peer: PeerIdentity): PacketId {
+        val message = handshakeMessages.getOrPut(peer) {
+            stats.handshakesInitiated++
+            sessions.beginHandshake(peer)
+        }
         return requireEngine().sendHandshake(peer, envelope(TYPE_HANDSHAKE_1, message))
     }
+
+    /**
+     * Housekeeping: retransmits handshakes that are due and reports those that
+     * have given up. Safe to call on a timer, and required for reliability.
+     */
+    fun tick() {
+        for (peer in handshakes.dueForRetry()) {
+            stats.handshakeRetries++
+            sendHandshakeMessage(peer)
+        }
+        for ((peer, failure) in handshakes.collectFailures()) {
+            stats.handshakesFailed++
+            handshakeMessages.remove(peer)
+            listener.onHandshakeFailed(peer, failure.reason, failure.attempts)
+        }
+    }
+
+    /** Current state of a handshake with [peer]. */
+    fun handshakeState(peer: PeerIdentity): HandshakeSupervisor.State = handshakes.state(peer)
 
     /**
      * Encrypts and sends [plaintext] to [peer].
@@ -103,12 +168,22 @@ class SecureMesh(
      * cannot be sent at all and is reported rather than thrown -- message length
      * is user input, and user input must not be able to crash the node.
      */
-    fun send(peer: PeerIdentity, plaintext: ByteArray): SendOutcome {
+    fun send(peer: PeerIdentity, plaintext: ByteArray): SendOutcome =
+        send(peer, plaintext, Session.MESSAGE_CHANNEL)
+
+    /**
+     * Sends on a specific session channel.
+     *
+     * File transfer uses its own channel so that legitimate chunk reordering is
+     * judged by the transfer's own bookkeeping rather than by a message-oriented
+     * replay window.
+     */
+    fun send(peer: PeerIdentity, plaintext: ByteArray, channel: Int): SendOutcome {
         if (plaintext.size > MAX_PLAINTEXT_SIZE) {
             return SendOutcome.TooLarge(plaintext.size, MAX_PLAINTEXT_SIZE)
         }
         val session = sessions.sessionFor(peer) ?: return SendOutcome.NoSession
-        val sealed = session.seal(plaintext, clock.nowMillis())
+        val sealed = session.seal(plaintext, clock.nowMillis(), channel)
         return SendOutcome.Queued(requireEngine().send(peer, envelope(TYPE_MESSAGE, sealed)))
     }
 
@@ -153,6 +228,8 @@ class SecureMesh(
             return
         }
         stats.handshakesCompleted++
+        handshakes.onEstablished(session.peer)
+        handshakeMessages.remove(session.peer)
         requireEngine().sendHandshake(session.peer, envelope(TYPE_HANDSHAKE_2, reply))
         listener.onSessionEstablished(session.peer)
     }
@@ -164,6 +241,8 @@ class SecureMesh(
             return
         }
         stats.handshakesCompleted++
+        handshakes.onEstablished(session.peer)
+        handshakeMessages.remove(session.peer)
         listener.onSessionEstablished(session.peer)
     }
 
@@ -205,8 +284,8 @@ class SecureMesh(
         /** Envelope type byte. */
         private const val ENVELOPE_OVERHEAD = 1
 
-        /** Sealed frame overhead: the cleartext counter plus the AEAD tag. */
-        private const val SEAL_OVERHEAD = 8 + 16
+        /** Sealed frame overhead: the cleartext channel and counter, plus the AEAD tag. */
+        private const val SEAL_OVERHEAD = Session.FRAME_HEADER_SIZE + 16
 
         /** Largest encryptable message that fits one packet. There is no fragmentation. */
         const val MAX_PLAINTEXT_SIZE = Packet.MAX_PAYLOAD_SIZE - ENVELOPE_OVERHEAD - SEAL_OVERHEAD
