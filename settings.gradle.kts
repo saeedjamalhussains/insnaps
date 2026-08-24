@@ -2,6 +2,7 @@ rootProject.name = "insnaps"
 
 pluginManagement {
     repositories {
+        google()
         gradlePluginPortal()
         mavenCentral()
     }
@@ -9,8 +10,10 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
+        google()
         mavenCentral()
     }
 }
 
 include(":core")
+include(":androidApp")

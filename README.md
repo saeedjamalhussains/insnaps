@@ -50,7 +50,11 @@ The protocol core is implemented, tested and stress-tested. Radios are not.
 | Capture / copy / notification protection policy | done, tested — **core policy only; Android and iOS implementations not written** |
 | Chunked encrypted file transfer (≤100 MB) | done, tested |
 | Sandbox: virtual phones, geography, mobility, simulated BLE | done — real core underneath, not a second implementation |
-| BLE / Wi-Fi transports (Android, iOS) | **not started** |
+| Android target (`commonMain` compiles + runs on ART) | done — verified on device, API 30 + 34 |
+| Android `CryptoProvider` (X25519 via Tink) | done — E2EE verified on device, 10/10 on Pixel 8 |
+| Link fragmentation (BLE frames < packet size) | done, tested — 543 B across 514 B and 20 B links |
+| Android BLE transport (`AndroidBleTransport`) | **written, not radio-validated** — no two phones have run it |
+| iOS BLE / Wi-Fi transports | **not started** |
 | Platform `IdentityStore` (Keystore / Keychain) | **not started** — interface only |
 | UI | **not started** |
 
@@ -58,10 +62,11 @@ The protocol core is implemented, tested and stress-tested. Radios are not.
 ./gradlew :core:jvmTest
 ```
 
-258 tests, about 2 minutes.
+275 tests, about 2 minutes.
 
 - Protocol specification: [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - Scale, adversarial and routing results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+- Testing strategy and what each layer can prove: [docs/TESTING.md](docs/TESTING.md)
 
 ## Milestones
 
@@ -73,9 +78,11 @@ v0.5  Normal/Private modes, file transfer, capture policy
 v0.6  sandbox: virtual phones on a map, simulated BLE
 v0.7  geographic routing fix: weighted-random selection
 v0.8  chunk-aware file transfer protocol
-v0.8.1 reliable delivery: handshake retry, manifest ack, selective ack  <- current
-v0.9  Android BLE
-v1.0  iOS BLE, then Android <-> iOS physical testing
+v0.8.1 reliable delivery: handshake retry, manifest ack, selective ack
+v0.9a Android crypto portability (Tink X25519), verified on device
+v0.9b Android BLE transport + link fragmentation  <- current (unvalidated on radio)
+v0.9c real multi-phone BLE mesh
+v1.0  iOS crypto + BLE, then Android <-> iOS physical testing
 ```
 
 ## Communication modes
@@ -263,6 +270,13 @@ queue before reaching the core.
 
 ## Known gaps
 
+- **The BLE transport has never moved a byte between two phones.** It compiles,
+  its fragmentation is unit-tested, and it constructs against a real Bluetooth
+  stack on a Pixel 8 — but MTU negotiation, connection stability, OEM quirks,
+  background behaviour, throughput and battery are all unmeasured. Test Lab
+  cannot settle this: one execution gets one device, and devices cannot be placed
+  in radio range of each other. It needs two phones on a desk.
+
 - **Reliable delivery has a measured envelope: ≤10% per-hop loss.** Beyond it,
   handshake establishment is marginal rather than deterministic — two packets must
   cross the whole path, so per-attempt success is the *square* of path survival
@@ -270,6 +284,10 @@ queue before reaching the core.
   fail at five. Beyond 30% on a long path, no retry budget helps.
 - **Repair is whole-round, not per-chunk.** A sender resends everything the
   receiver reports missing, so a lossy transfer costs ~2.9x at 30% loss/hop.
+- **The Android acceptance run has only been done on one device.** Pixel 8 /
+  API 34 passed 10/10; API 30 and other OEMs are unverified because the Test Lab
+  daily quota was exhausted. Tink's X25519 does not depend on API level, so API 30
+  is expected to pass, but expected is not measured.
 - **The Android and iOS capture protections are not implemented.** What exists is
   the decision logic in `commonMain` — when private content must be hidden, what
   a notification may say, what copy is permitted — with tests. The platform code

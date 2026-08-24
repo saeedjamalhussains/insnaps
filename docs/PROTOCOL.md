@@ -1,6 +1,6 @@
 # insnaps protocol specification
 
-Version 0.8.1 (core), draft. Normative statements use MUST / SHOULD / MAY.
+Version 0.9 (core), draft. Normative statements use MUST / SHOULD / MAY.
 
 **Platform scope: insnaps is exclusively an Android and iOS mobile application.**
 There is no desktop target and none is to be added. The JVM build exists only as
@@ -629,6 +629,36 @@ analytics, telemetry, debug output, crash reports or any file.
 > camera or recording device from photographing or recording the display.**
 
 This MUST be stated plainly in the product and never implied away.
+
+---
+
+## 11.2 Link fragmentation
+
+A transport whose frames are smaller than a packet MUST fragment and reassemble
+below the [Transport] boundary. The packet format does not change to suit a
+radio.
+
+BLE forces this: a full insnaps packet is **543 bytes**, the largest ATT write is
+**514** (MTU 517 less the 3-byte header), and before MTU negotiation a link
+carries **20**. Confirmed on a Pixel 8 running API 34.
+
+```
+  version | sequence | index | total | body
+     1         1         1       1      n
+```
+
+Rules, all of which exist because reassembly buffers hold bytes from anyone in
+radio range:
+
+- A message MUST NOT exceed [MAX_FRAGMENTS] (64) fragments.
+- Accumulated bytes MUST be refused *before allocation* once they would exceed
+  one maximum packet.
+- Partial messages MUST be bounded per peer and per node, and MUST expire.
+- Duplicate fragments MUST be ignored, and out-of-order fragments accepted:
+  both are ordinary on a mesh.
+- A sender changing the fragment count mid-message MUST be rejected.
+
+Reassembly buffers count toward the relay memory ceiling (§6).
 
 ---
 
